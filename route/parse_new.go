@@ -69,57 +69,51 @@ route weight service host/path weight w tags "tag1,tag2"
 // Deleting a route that has not been created yet yields
 // a different result than the other way around.
 func Parse(in *bytes.Buffer) (defs []*RouteDef, err error) {
-	var def *RouteDef
 	var i int
 	scanner := bufio.NewScanner(in)
 	for scanner.Scan() {
-		var err error
-		result := strings.TrimSpace(scanner.Text())
 		i++
-		switch {
-		case reComment.MatchString(result) || reBlankLine.MatchString(result):
-			continue
-		case reRouteAdd.MatchString(result):
-			def, err = parseRouteAdd(result)
-		case reRouteDel.MatchString(result):
-			def, err = parseRouteDel(result)
-		case reRouteWeight.MatchString(result):
-			def, err = parseRouteWeight(result)
-		default:
-			err = errors.New("syntax error: 'route' expected")
-		}
+		def, err := parseLine(scanner.Text())
 		if err != nil {
 			return nil, fmt.Errorf("line %d: %s", i, err)
 		}
-		defs = append(defs, def)
+		if def != nil {
+			defs = append(defs, def)
+		}
 	}
 	return defs, nil
+}
+
+// parseLine parses a single route command. Empty lines and comments return
+// (nil, nil) since they do not contribute a command.
+func parseLine(line string) (*RouteDef, error) {
+	result := strings.TrimSpace(line)
+	switch {
+	case reComment.MatchString(result) || reBlankLine.MatchString(result):
+		return nil, nil
+	case reRouteAdd.MatchString(result):
+		return parseRouteAdd(result)
+	case reRouteDel.MatchString(result):
+		return parseRouteDel(result)
+	case reRouteWeight.MatchString(result):
+		return parseRouteWeight(result)
+	default:
+		return nil, errors.New("syntax error: 'route' expected")
+	}
 }
 
 // ParseAliases scans a set of route commands for the "register" option and
 // returns a list of services which should be registered by the backend.
 func ParseAliases(in string) (names []string, err error) {
 	var defs []*RouteDef
-	var def *RouteDef
 	for i, s := range strings.Split(in, "\n") {
-		var err error
-		s = strings.TrimSpace(s)
-		switch {
-		case reComment.MatchString(s) || reBlankLine.MatchString(s):
-			continue
-		case reRouteAdd.MatchString(s):
-			def, err = parseRouteAdd(s)
-		case reRouteDel.MatchString(s):
-			def, err = parseRouteDel(s)
-		case reRouteWeight.MatchString(s):
-			def, err = parseRouteWeight(s)
-		default:
-			err = errors.New("syntax error: 'route' expected")
-		}
+		def, err := parseLine(s)
 		if err != nil {
 			return nil, fmt.Errorf("line %d: %s", i+1, err)
 		}
-		defs = append(defs, def)
+		if def != nil {
+			defs = append(defs, def)
+		}
 	}
 
 	var aliases []string

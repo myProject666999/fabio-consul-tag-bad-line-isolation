@@ -57,11 +57,14 @@ func listKV(client *api.Client, path string, waitIndex uint64, separator bool, r
 	}
 	var s []string
 	for _, kvpair := range kvpairs {
-		val := strings.TrimSpace(string(kvpair.Value))
-		if separator {
-			val = "# --- " + kvpair.Key + "\n" + val
+		if !separator {
+			s = append(s, strings.TrimSpace(string(kvpair.Value)))
+			continue
 		}
-		s = append(s, val)
+		// The manual configuration is written by a human. Keep the value
+		// untrimmed so that a line number reported for invalid content
+		// matches the raw content shown in the Consul UI.
+		s = append(s, "# --- "+kvpair.Key+"\n"+string(kvpair.Value))
 	}
 	return strings.Join(s, "\n\n"), meta.LastIndex, nil
 }

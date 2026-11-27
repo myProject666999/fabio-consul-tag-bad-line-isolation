@@ -599,6 +599,17 @@ func watchBackend(cfg *config.Config, first chan bool) {
 		customBE    string
 		once        sync.Once
 		tableBuffer = new(bytes.Buffer) // fix crash on reset before used (#650)
+
+		// effectiveManual is the last manual configuration which was
+		// accepted. While a new manual configuration is rejected this
+		// value stays in effect so that service side changes still
+		// reach the routing table.
+		effectiveManual string
+
+		// manualErr holds the error of the currently rejected manual
+		// configuration and is empty while the manual configuration is
+		// accepted. It is used to log only state transitions.
+		manualErr string
 	)
 
 	switch cfg.Registry.Backend {
@@ -619,36 +630,131 @@ func watchBackend(cfg *config.Config, first chan bool) {
 		man := registry.Default.WatchManual()
 
 		for {
+			manualChanged := false
 			select {
 			case svccfg = <-svc:
 			case mancfg = <-man:
+				manualChanged = true
 			}
+
+			// The manual configuration is all-or-nothing: a single bad
+			// line rejects the whole manual configuration but must not
+			// block changes from the service side. Until the content is
+			// fixed the last accepted manual configuration stays in
+			// effect.
+			if manualChanged {
+				if err := validateManualConfig(cfg.Registry.Consul.KVPath, mancfg); err != nil {
+					if msg := err.Error(); msg != manualErr {
+						log.Printf("[WARN] %s", msg)
+						manualErr = msg
+					}
+				} else {
+					if manualErr != "" {
+						log.Print("[INFO] Manual configuration accepted again")
+						manualErr = ""
+					}
+					effectiveManual = mancfg
+				}
+			}
+
 			// manual config overrides service config - order matters
 			tableBuffer.Reset()
 			tableBuffer.WriteString(svccfg)
 			tableBuffer.WriteString("\n")
-			tableBuffer.WriteString(mancfg)
+			tableBuffer.WriteString(effectiveManual)
 			// set nextTable here to preserve the state.  The buffer is altered
 			// when calling route.NewTable and we lose change logging (#737)
-			if nextTable = tableBuffer.String(); nextTable == lastTable {
+			nextTable = tableBuffer.String()
+			if nextTable == lastTable {
+				continue
+			}
+
+			t, err := route.NewTable(bytes.NewBufferString(nextTable))
+			if err != nil {
+				log.Printf("[WARN] %s", err)
 				continue
 			}
 			aliases, err := route.ParseAliases(nextTable)
-			if err != nil {
-				log.Printf("[WARN]: %s", err)
-			}
-			registry.Default.Register(aliases)
-			t, err := route.NewTable(tableBuffer)
 			if err != nil {
 				log.Printf("[WARN] %s", err)
 				continue
 			}
 			route.SetTable(t)
+			registry.Default.Register(aliases)
 			logRoutes(t, lastTable, nextTable, cfg.Log.RoutesFormat)
 			lastTable = nextTable
 			once.Do(func() { close(first) })
 		}
 	}
+}
+
+// manualKeyHeader is the prefix of the separator line which the consul
+// backend writes in front of the content of every manual KV key.
+const manualKeyHeader = "# --- "
+
+// manualLine is one line of a manual configuration together with the KV
+// key it belongs to and its 1-based line number within the original
+// (untrimmed) key content.
+type manualLine struct {
+	key  string
+	line int
+	text string
+}
+
+// splitManualConfig splits the merged manual configuration into lines and
+// associates each content line with the key it belongs to.
+//
+// Separator lines are recognised by the prefix which listKV writes plus
+// the KV path, not by the bare "# --- " prefix alone: the manual
+// configuration is written by a human and may legitimately contain a
+// comment such as "# --- disabled". A content line would still be taken
+// for a separator if it reproduced the full separator line of a key
+// verbatim, which is acceptable because such a line carries no route
+// command either way.
+func splitManualConfig(kvPath, in string) []manualLine {
+	base := manualKeyHeader + strings.TrimPrefix(kvPath, "/")
+	isSeparator := func(s string) bool {
+		// The separator of the configured path itself, and of any key
+		// below it. The boundary check keeps a key such as
+		// "fabio/configx" from being taken for a separator.
+		if s == base {
+			return true
+		}
+		return strings.HasPrefix(s, base+"/")
+	}
+
+	var out []manualLine
+	var key string
+	var line int
+	for _, raw := range strings.Split(in, "\n") {
+		if isSeparator(raw) {
+			key = strings.TrimSpace(strings.TrimPrefix(raw, manualKeyHeader))
+			line = 0
+			continue
+		}
+		line++
+		out = append(out, manualLine{key: key, line: line, text: strings.TrimSpace(raw)})
+	}
+	return out
+}
+
+// validateManualConfig validates every line of the manual configuration.
+// A single invalid line rejects the manual configuration as a whole instead
+// of being dropped line by line: the manual configuration is written by a
+// human, and applying only the valid lines of a rejected edit would make the
+// operator's edit silently half-effective (for example a valid route del in
+// an edit which also contains a typo would delete a route the operator
+// intended to keep while the typo also disappears from the log).
+func validateManualConfig(kvPath, in string) error {
+	for _, l := range splitManualConfig(kvPath, in) {
+		if err := route.ValidateRouteCommand(l.text); err != nil {
+			if l.key == "" {
+				return fmt.Errorf("invalid manual configuration at line %d: %s", l.line, err)
+			}
+			return fmt.Errorf("invalid manual configuration in key %q line %d: %s", l.key, l.line, err)
+		}
+	}
+	return nil
 }
 
 func watchNoRouteHTML() {
